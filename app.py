@@ -11,6 +11,11 @@ import requests
 
 app = Flask(__name__)
 
+# ========= 已处理事件缓存（用于去重） =========
+# key: event_id, value: 处理时间戳
+PROCESSED_EVENTS = {}
+PROCESSED_TTL = 60 * 5  # 只保存最近 5 分钟的 event_id，防止内存无限增长
+
 # ========= 环境变量 =========
 FEISHU_APP_ID = os.getenv("FEISHU_APP_ID")
 FEISHU_APP_SECRET = os.getenv("FEISHU_APP_SECRET")
@@ -106,7 +111,8 @@ def send_message(chat_id: str, text: str):
 
 
 def handle_event(event_data: dict):
-    """处理飞书事件（只关心 im.message.receive_v1）"""
+    """处理飞书事件（只关心 im.message.receive_v1），带事件去重"""
+
     # 飞书新事件是 2.0 格式
     if event_data.get("schema") != "2.0":
         print("⚠️ 非 2.0 事件，直接忽略:", event_data)
@@ -114,7 +120,26 @@ def handle_event(event_data: dict):
 
     header = event_data.get("header", {})
     event_type = header.get("event_type")
+    event_id = header.get("event_id")  # 用于去重
     event = event_data.get("event", {})
+
+    # ========= 去重逻辑开始 =========
+    now = time.time()
+
+    # 清理过期的 event_id
+    expired_ids = [eid for eid, ts in PROCESSED_EVENTS.items() if now - ts > PROCESSED_TTL]
+    for eid in expired_ids:
+        PROCESSED_EVENTS.pop(eid, None)
+
+    if event_id:
+        if event_id in PROCESSED_EVENTS:
+            print(f"♻️ 收到重复事件，event_id={event_id}，不再处理")
+            return
+        # 先记录为已处理，避免中途出错又重复处理
+        PROCESSED_EVENTS[event_id] = now
+    else:
+        print("⚠️ 事件没有 event_id，无法去重")
+    # ========= 去重逻辑结束 =========
 
     if event_type == "im.message.receive_v1":
         message = event.get("message", {})
@@ -131,7 +156,7 @@ def handle_event(event_data: dict):
 
         user_text = content_obj.get("text", "").strip()
 
-        print(f"💬 收到消息: chat_id={chat_id}, type={msg_type}, text={user_text}")
+        print(f"💬 收到消息: event_id={event_id}, chat_id={chat_id}, type={msg_type}, text={user_text}")
 
         if chat_id and msg_type == "text" and user_text:
             reply = call_qwen(user_text)
@@ -178,7 +203,7 @@ def feishu_webhook():
 
 @app.route("/")
 def home():
-    return jsonify({"status": "Feishu Qwen Bot is running (no-encrypt version)"})
+    return jsonify({"status": "Feishu Qwen Bot is running (no-encrypt version, with dedupe)"})
 
 
 if __name__ == "__main__":
