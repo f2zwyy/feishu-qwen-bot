@@ -78,8 +78,9 @@ def call_qwen(user_msg: str) -> str:
 
 # -------- 飞书请求数据模型（简单封装，方便类型提示） --------
 class FeishuEventEnvelope(BaseModel):
-    # 用 envelope_schema 作为内部名字，对外仍然接收 "schema"
+    # 使用 envelope_schema 作为内部变量，alias 让它仍然兼容飞书的 "schema"
     envelope_schema: Optional[str] = Field(default=None, alias="schema")
+
     header: Optional[Dict[str, Any]] = None
     event: Optional[Dict[str, Any]] = None
     challenge: Optional[str] = None
