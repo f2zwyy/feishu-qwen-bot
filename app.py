@@ -5,7 +5,7 @@ from typing import Any, Dict, Optional
 
 import requests
 from fastapi import FastAPI, Request
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 # -------- 日志设置 --------
 logging.basicConfig(level=logging.INFO)
@@ -78,7 +78,8 @@ def call_qwen(user_msg: str) -> str:
 
 # -------- 飞书请求数据模型（简单封装，方便类型提示） --------
 class FeishuEventEnvelope(BaseModel):
-    schema: Optional[str] = None
+    # 用 envelope_schema 作为内部名字，对外仍然接收 "schema"
+    envelope_schema: Optional[str] = Field(default=None, alias="schema")
     header: Optional[Dict[str, Any]] = None
     event: Optional[Dict[str, Any]] = None
     challenge: Optional[str] = None
