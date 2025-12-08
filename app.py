@@ -5,26 +5,23 @@ from typing import Any, Dict, Optional
 
 import requests
 from fastapi import FastAPI, Request
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
-# -------- 日志设置 --------
+# ---------- 日志 ----------
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# -------- 读取环境变量（请在 ECS 上 export） --------
+# ---------- 环境变量（在 ECS 上设置） ----------
 FEISHU_APP_ID = os.getenv("FEISHU_APP_ID", "")
 FEISHU_APP_SECRET = os.getenv("FEISHU_APP_SECRET", "")
+
 QWEN_API_KEY = os.getenv("QWEN_API_KEY", "")
-QWEN_MODEL = os.getenv("QWEN_MODEL", "qwen-plus")  # 可改成你常用的模型
+QWEN_MODEL = os.getenv("QWEN_MODEL", "qwen-plus")
 
-app = FastAPI(title="Feishu-Qwen-Bot on Aliyun ECS")
+app = FastAPI(title="Feishu-Qwen-Bot")
 
-# -------- 通义千问调用封装（DashScope HTTP 接口） --------
+# ---------- 通义千问 ----------
 def call_qwen(user_msg: str) -> str:
-    """
-    调用通义千问，输入一段用户消息，返回一段文字回复。
-    如果你习惯用 DashScope SDK 或 OpenAI 兼容接口，也可以自己替换这里。
-    """
     if not QWEN_API_KEY:
         return "后端未配置 QWEN_API_KEY，请联系管理员设置环境变量。"
 
@@ -44,20 +41,17 @@ def call_qwen(user_msg: str) -> str:
                 {"role": "user", "content": user_msg},
             ]
         },
-        # 参考官方文档，可以加参数：temperature、max_tokens、result_format 等
         "parameters": {
-            "result_format": "message"  # 新版推荐，用 message 格式
+            "result_format": "message"
         },
     }
 
     try:
-        resp = requests.post(url, headers=headers, data=json.dumps(payload), timeout=30)
+        resp = requests.post(url, headers=headers, json=payload, timeout=30)
         resp.raise_for_status()
         data = resp.json()
 
-        # 兼容几种返回格式
         output = data.get("output", {})
-        # 1) 新版 message 格式
         choices = output.get("choices")
         if choices:
             message = choices[0].get("message", {})
@@ -65,7 +59,6 @@ def call_qwen(user_msg: str) -> str:
             if content:
                 return content
 
-        # 2) 旧版 text 字段
         text = output.get("text")
         if text:
             return text
@@ -76,11 +69,8 @@ def call_qwen(user_msg: str) -> str:
         return f"调用通义千问出错：{e}"
 
 
-# -------- 飞书请求数据模型（简单封装，方便类型提示） --------
+# ---------- 飞书数据模型（不再使用 schema 字段） ----------
 class FeishuEventEnvelope(BaseModel):
-    # 使用 envelope_schema 作为内部变量，alias 让它仍然兼容飞书的 "schema"
-    envelope_schema: Optional[str] = Field(default=None, alias="schema")
-
     header: Optional[Dict[str, Any]] = None
     event: Optional[Dict[str, Any]] = None
     challenge: Optional[str] = None
@@ -88,39 +78,100 @@ class FeishuEventEnvelope(BaseModel):
     token: Optional[str] = None
 
 
+# ---------- 获取 tenant_access_token，用来回消息 ----------
+_tenant_access_token: Optional[str] = None
+_tenant_access_token_expire: int = 0  # 时间戳，简单实现
+
+def get_tenant_access_token() -> str:
+    """
+    根据 app_id / app_secret 获取 tenant_access_token
+    """
+    import time
+
+    global _tenant_access_token, _tenant_access_token_expire
+
+    now = int(time.time())
+    if _tenant_access_token and now < _tenant_access_token_expire - 60:
+        return _tenant_access_token
+
+    url = "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal"
+    payload = {
+        "app_id": FEISHU_APP_ID,
+        "app_secret": FEISHU_APP_SECRET,
+    }
+    resp = requests.post(url, json=payload, timeout=10)
+    data = resp.json()
+    if data.get("code") != 0:
+        raise RuntimeError(f"获取 tenant_access_token 失败: {data}")
+
+    _tenant_access_token = data["tenant_access_token"]
+    _tenant_access_token_expire = now + data.get("expire", 3600)
+    return _tenant_access_token
+
+
+def feishu_reply_message(message_id: str, text: str) -> None:
+    """
+    调用飞书接口，回复一条消息。
+    这里用的是「reply」接口，你也可以改成按 chat_id 发新消息。
+    """
+    if not FEISHU_APP_ID or not FEISHU_APP_SECRET:
+        logger.error("FEISHU_APP_ID / FEISHU_APP_SECRET 未配置，无法回复消息")
+        return
+
+    try:
+        token = get_tenant_access_token()
+    except Exception:
+        logger.exception("获取 tenant_access_token 失败，无法回复消息")
+        return
+
+    url = f"https://open.feishu.cn/open-apis/im/v1/messages/{message_id}/reply"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json; charset=utf-8",
+    }
+    body = {
+        "msg_type": "text",
+        "content": json.dumps({"text": text}, ensure_ascii=False),
+    }
+
+    try:
+        resp = requests.post(url, headers=headers, json=body, timeout=10)
+        data = resp.json()
+        if data.get("code") != 0:
+            logger.error(f"回复消息失败: {data}")
+        else:
+            logger.info("已回复飞书消息")
+    except Exception:
+        logger.exception("调用飞书回复接口失败")
+
+
+# ---------- 健康检查 ----------
 @app.get("/")
 async def root():
-    return {"message": "Feishu-Qwen-Bot is running on Aliyun ECS."}
+    return {"message": "Feishu-Qwen-Bot is running."}
 
 
-# -------- 飞书回调入口（路径可以按照你在飞书配置的来改） --------
+# ---------- 飞书回调入口 ----------
 @app.post("/feishu/webhook")
 async def feishu_webhook(request: Request):
-    """
-    飞书事件订阅 / 机器人回调入口。
-    兼容：
-    - URL 校验：type = url_verification
-    - 事件回调：type = event_callback（消息事件等）
-    """
     body = await request.json()
     logger.info(f"收到飞书请求: {body}")
 
     envelope = FeishuEventEnvelope(**body)
 
-    # 1) URL 校验（飞书配置回调地址时第一次会发这种请求）
+    # 1) URL 校验
     if envelope.type == "url_verification" and envelope.challenge:
         return {"challenge": envelope.challenge}
 
-    # 2) 普通事件回调
+    # 2) 事件回调
     event = envelope.event or {}
     event_type = event.get("type")
 
-    # 这里只做最常见的“接收文本消息 -> 调用通义千问 -> 返回文本”
-    # 你可以根据自己原来的逻辑，把 event 结构补全 / 修改。
     if event_type == "im.message.receive_v1":
         message = event.get("message", {})
         msg_type = message.get("message_type")
         content_raw = message.get("content", "{}")
+        message_id = message.get("message_id", "")
 
         user_text = ""
         if msg_type == "text":
@@ -135,16 +186,20 @@ async def feishu_webhook(request: Request):
         else:
             reply_text = call_qwen(user_text)
 
-        # ⚠️ 注意：对“事件订阅机器人”，通常需要主动调用飞书接口回复消息，
-        # 而不是直接在回调返回内容。
-        # 你原来的项目如果已经实现了“主动调用飞书 API 回复”的逻辑，
-        # 可以把那部分代码搬到这里来调用。
-        #
-        # 这里为了简单，回调只返回 200 + "ok"。
-        # 真正的回复由你在现有代码里调用飞书 OpenAPI 完成。
-        logger.info(f"准备回复用户: {reply_text}")
+        # 主动调用飞书 API 回复
+        if message_id:
+            feishu_reply_message(message_id, reply_text)
+        else:
+            logger.warning("没有拿到 message_id，无法直接回复消息")
 
         return {"code": 0, "message": "ok"}
 
-    # 其他事件类型暂时不处理
+    # 其他事件先忽略
     return {"code": 0, "message": "ignored"}
+
+
+# ---------- 直接 python3 app.py 运行 ----------
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run(app, host="0.0.0.0", port=8000)
